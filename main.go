@@ -58,7 +58,18 @@ var (
 
 	b64             = base64.NewEncoding("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_z")
 	printerConfig   = printer.Config{Mode: printer.RawFormat}
-	origTypesConfig = types.Config{Importer: importer.ForCompiler(fset, "gc", origLookup)}
+
+	// listPackage helps implement a types.Importer which finds the export
+	// data for the original dependencies, not their garbled counterparts.
+	// This is useful to typecheck a package before it's garbled, so we can
+	// make decisions on how to garble it.
+	origTypesConfig = types.Config{Importer: importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
+		pkg, err := listPackage(path)
+		if err != nil {
+			return nil, err
+		}
+		return os.Open(pkg.Export)
+	})}
 
 	buildInfo       = packageInfo{imports: make(map[string]importedPkg)}
 	garbledImporter = importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) {
@@ -69,27 +80,27 @@ var (
 	envGoPrivate string // filled via 'go env' below to support 'go env -w'
 )
 
-// origLookup helps implement a types.Importer which finds the export data for
-// the original dependencies, not their garbled counterparts. This is useful to
-// typecheck a package before it's garbled, so we can make decisions on how to
-// garble it.
-func origLookup(path string) (io.ReadCloser, error) {
+type listedPackage struct {
+	Export string
+	Deps   []string
+}
+
+// listPackage is a simple wrapper around 'go list -json'.
+func listPackage(path string) (listedPackage, error) {
+	var pkg listedPackage
 	cmd := exec.Command("go", "list", "-json", "-export", path)
 	if envGarbleDir == "" {
-		return nil, fmt.Errorf("$GARBLE_DIR unset; did you run via 'garble build'?")
+		return pkg, fmt.Errorf("$GARBLE_DIR unset; did you run via 'garble build'?")
 	}
 	cmd.Dir = envGarbleDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("go list error: %v: %s", err, out)
+		return pkg, fmt.Errorf("go list error: %v: %s", err, out)
 	}
-	var res struct {
-		Export string
+	if err := json.Unmarshal(out, &pkg); err != nil {
+		return pkg, err
 	}
-	if err := json.Unmarshal(out, &res); err != nil {
-		return nil, err
-	}
-	return os.Open(res.Export)
+	return pkg, nil
 }
 
 func garbledImport(path string) (*types.Package, error) {
@@ -381,7 +392,12 @@ func readBuildIDs(flags []string) error {
 	if importcfg == "" {
 		return fmt.Errorf("could not find -importcfg argument")
 	}
-	data, err := ioutil.ReadFile(importcfg)
+	f, err := os.OpenFile(importcfg, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	data, err := ioutil.ReadAll(f)
 	if err != nil {
 		return err
 	}
@@ -416,6 +432,40 @@ func readBuildIDs(flags []string) error {
 		}
 	}
 	// log.Printf("%#v", buildInfo)
+
+	// Since string obfuscation adds crypto dependencies, ensure they are
+	// also part of the importcfg. Otherwise, the compiler or linker might
+	// error when trying to locate them.
+	// TODO: only do this when string obfuscation is enabled.
+	// TODO: this means these packages can't be garbled. never garble std?
+	toAdd := []string{
+		"crypto/aes",
+		"crypto/cipher",
+	}
+	for len(toAdd) > 0 {
+		// Use a stack, to reuse memory.
+		path := toAdd[len(toAdd)-1]
+		toAdd = toAdd[:len(toAdd)-1]
+		if _, ok := buildInfo.imports[path]; ok {
+			continue
+		}
+		pkg, err := listPackage(path)
+		if err != nil {
+			return err
+		}
+		if pkg.Export == "" {
+			continue // e.g. unsafe
+		}
+		if _, err := fmt.Fprintf(f, "packagefile %s=%s\n", path, pkg.Export); err != nil {
+			return err
+		}
+		// Add their dependencies too, without adding duplicates.
+		buildInfo.imports[path] = importedPkg{packagefile: pkg.Export}
+		toAdd = append(toAdd, pkg.Deps...)
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
 	return nil
 }
 
